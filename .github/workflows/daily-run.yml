@@ -7,6 +7,7 @@ on:
     - cron: '0 1 * * *'
   
   # This allows you to run the workflow manually from the Actions tab on GitHub.
+  # This is useful for testing and on-demand runs.
   workflow_dispatch:
 
 jobs:
