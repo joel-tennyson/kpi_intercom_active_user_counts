@@ -8,16 +8,22 @@ import uuid
 from datetime import datetime
 
 if len(sys.argv) < 2:
-    print("Usage: python count_intercom_users.py <recency_days> [--test] [--tag] [--tag-test]")
+    print("Usage: python count_intercom_users.py <recency_days> [--test] [--tag] [--tag-test] [--untag-test]")
     print("  --test: Use sample data instead of querying Intercom API")
     print("  --tag: Tag 7S1 profiles with 'Recently Active on 7S1 Only' tag")
     print("  --tag-test: Tag only first batch of 50 7S1 profiles for testing")
+    print("  --untag-test: Test untagging by untagging only first 10 users")
+    print("  Note: Untagging is automatically enabled whenever tagging is enabled")
     sys.exit(1)
 
 # Check for test mode and tagging modes
 TEST_MODE = "--test" in sys.argv
 TAG_MODE = "--tag" in sys.argv
 TAG_TEST_MODE = "--tag-test" in sys.argv
+UNTAG_TEST_MODE = "--untag-test" in sys.argv
+
+# Untagging is enabled whenever tagging is enabled
+UNTAG_MODE = TAG_MODE or TAG_TEST_MODE or UNTAG_TEST_MODE
 
 if TEST_MODE:
     print("🧪 Running in TEST MODE - using sample data")
@@ -25,6 +31,10 @@ if TAG_MODE:
     print("🏷️  Tagging mode enabled - will tag ALL 7S1 profiles")
 if TAG_TEST_MODE:
     print("🧪🏷️  Tag test mode enabled - will tag only first batch of 50 profiles")
+if UNTAG_TEST_MODE:
+    print("🧪🏷️  Untag test mode enabled - will untag only first 10 users")
+if UNTAG_MODE and not (TAG_MODE or TAG_TEST_MODE):
+    print("🏷️  Untagging mode enabled - will only untag users")
 
 # --- Configuration ---
 RECENCY_DAYS = int(sys.argv[1])
@@ -93,6 +103,128 @@ def tag_batch_of_users(user_ids, tag_name):
     response = requests.post(url, json=payload, headers=headers, timeout=30)
     response.raise_for_status()
     return response.json()
+
+def fetch_tagged_users(tag_name="Recently Active on 7S1 Only"):
+    """Fetch all users who currently have the specified tag."""
+    all_tagged_users = []
+    starting_after = None
+    page = 1
+    
+    # Error handling config
+    max_retries = 5
+    retry_count = 0
+    
+    filter_block = [
+        {"field": "role", "operator": "=", "value": "user"},
+        {"field": "tag_id", "operator": "=", "value": "12271342"}
+    ]
+    
+    print(f"Fetching users with tag: '{tag_name}'", flush=True)
+
+    while True:
+        body = { "query": {"operator": "AND", "value": filter_block}, "pagination": {"per_page": PER_PAGE} }
+        if starting_after:
+            body["pagination"]["starting_after"] = starting_after
+
+        try:
+            response = requests.post(API_URL, headers=headers, json=body)
+            
+            # Handle rate limiting with retries
+            if response.status_code == 429:
+                if retry_count >= max_retries:
+                    print(f"Error: Exceeded max rate-limit retries ({max_retries}). Aborting.", file=sys.stderr)
+                    sys.exit(1)
+                
+                retry_after = int(response.headers.get("Retry-After", 10))
+                print(f"Rate limited. Retrying after {retry_after}s... (Attempt {retry_count + 1}/{max_retries})", flush=True)
+                retry_count += 1
+                time.sleep(retry_after)
+                continue
+            
+            # Reset retry counter on a successful request
+            retry_count = 0
+            
+            response.raise_for_status()
+            data = response.json()
+
+        except requests.exceptions.RequestException as e:
+            print(f"\nError: A critical request error occurred while fetching tagged users: {e}", file=sys.stderr)
+            sys.exit(1)
+        
+        if 'errors' in data:
+            print(f"\nError: Intercom API returned an error while fetching tagged users: {json.dumps(data['errors'], indent=2)}", file=sys.stderr)
+            sys.exit(1)
+            
+        users_on_page = data.get("data", [])
+        all_tagged_users.extend(users_on_page)
+        
+        print(f"  - Page {page}: Fetched {len(users_on_page)} tagged users (Total so far: {len(all_tagged_users)})", flush=True)
+        page += 1
+        
+        next_page = data.get("pages", {}).get("next")
+        if not next_page:
+            break
+        starting_after = next_page.get("starting_after")
+
+    return all_tagged_users
+
+def untag_user(user_id, tag_id="12271342"):
+    """Remove a tag from a single user."""
+    url = f"https://api.intercom.io/contacts/{user_id}/tags/{tag_id}"
+    
+    headers_with_version = {
+        "Authorization": f"Bearer {TOKEN}",
+        "Intercom-Version": "2.14"
+    }
+    
+    response = requests.delete(url, headers=headers_with_version, timeout=30)
+    response.raise_for_status()
+    return response.status_code == 200
+
+def untag_users_individually(user_ids_to_untag, tag_name="Recently Active on 7S1 Only", delay_seconds=0.4, test_mode_limit=None):
+    """Untag users individually with rate limiting."""
+    if not user_ids_to_untag:
+        print("No users to untag.")
+        return 0, 0
+    
+    total_to_untag = len(user_ids_to_untag)
+    
+    # Apply test mode limit if specified
+    if test_mode_limit:
+        print(f"\n🧪 TEST UNTAGGING: Only untagging first {min(test_mode_limit, total_to_untag)} users out of {total_to_untag} total")
+        user_ids_to_untag = user_ids_to_untag[:test_mode_limit]
+        total_to_untag = len(user_ids_to_untag)
+    else:
+        print(f"\nUntagging {total_to_untag} users individually (rate: ~{1/delay_seconds:.1f} per second)...")
+    
+    successful_untags = 0
+    failed_untags = 0
+    
+    for i, user_id in enumerate(user_ids_to_untag):
+        try:
+            untag_user(user_id)
+            successful_untags += 1
+            
+            # Progress reporting every 50 operations
+            if (i + 1) % 50 == 0:
+                print(f"✓ Untagged {i + 1}/{total_to_untag} users")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"✗ Failed to untag user {user_id}: {e}")
+            failed_untags += 1
+            
+            # Handle rate limiting specifically
+            if hasattr(e, 'response') and e.response.status_code == 429:
+                retry_after = int(e.response.headers.get("Retry-After", 10))
+                print(f"  Rate limited. Waiting {retry_after}s before continuing...")
+                time.sleep(retry_after)
+        
+        # Rate limiting: wait between requests (except for the last one)
+        if i < total_to_untag - 1:
+            time.sleep(delay_seconds)
+    
+    print(f"Untagging complete: {successful_untags} users untagged, {failed_untags} failures")
+    return successful_untags, failed_untags
 
 def tag_7s1_profiles_in_batches(profile_ids, tag_name="Recently Active on 7S1 Only", batch_size=50, test_mode_single_batch=False):
     """Tag 7S1 profiles in batches with rate limiting and error handling."""
@@ -190,9 +322,11 @@ def send_to_coda(data, webhook_url, api_token):
         "counts": counts_array,
     }
 
-    # Include tagging results if available
+    # Include tagging and untagging results if available
     if "tagging_results" in data:
         coda_payload["tagging_results"] = data["tagging_results"]
+    if "untagging_results" in data:
+        coda_payload["untagging_results"] = data["untagging_results"]
 
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -281,8 +415,8 @@ def fetch_all_users(start_query_timestamp):
     max_retries = 5
     retry_count = 0
     
-    filter_block = [
-        {"field": "role", "operator": "=", "value": "user"},
+        filter_block = [
+            {"field": "role", "operator": "=", "value": "user"},
         {"field": "email", "operator": "!=", "value": None},
         {"field": "external_id", "operator": "!=", "value": None},
         {"field": "last_seen_at", "operator": ">", "value": start_query_timestamp}
@@ -296,7 +430,7 @@ def fetch_all_users(start_query_timestamp):
             body["pagination"]["starting_after"] = starting_after
 
         try:
-            response = requests.post(API_URL, headers=headers, json=body)
+        response = requests.post(API_URL, headers=headers, json=body)
             
             # Handle rate limiting with retries
             if response.status_code == 429:
@@ -314,7 +448,7 @@ def fetch_all_users(start_query_timestamp):
             retry_count = 0
             
             response.raise_for_status() # Raise an exception for other bad responses (4xx or 5xx)
-            data = response.json()
+        data = response.json()
 
         except requests.exceptions.RequestException as e:
             print(f"\nError: A critical request error occurred: {e}", file=sys.stderr)
@@ -443,13 +577,13 @@ else:
     only_7s1_profile_ids = []
 
     subscription_buckets = ["Unknown", "Admin", "Coach", "Live", "Core", "Free"]
-    subscription_counts = {
+subscription_counts = {
         "only_7s2": {sub: {"regular": 0, "fee_waiver": 0} for sub in subscription_buckets},
         "only_7s1": {sub: {"regular": 0, "fee_waiver": 0} for sub in subscription_buckets},
         "both": {sub: {"regular": 0, "fee_waiver": 0} for sub in subscription_buckets}
-    }
+}
 
-    for email, users in all_users_by_email.items():
+for email, users in all_users_by_email.items():
         s1_profile_count = len(users["7S1"])
         s2_profile_count = len(users["7S2"])
         total_profiles_for_email = s1_profile_count + s2_profile_count
@@ -459,11 +593,11 @@ else:
 
         has_active_7s1 = s1_profile_count > 0
         has_active_7s2 = s2_profile_count > 0
-        
-        # Get highest subscription across both profiles
-        highest_rank = get_highest_subscription(users["7S1"], users["7S2"])
-        subscription = rank_to_subscription(highest_rank)
-
+    
+    # Get highest subscription across both profiles
+    highest_rank = get_highest_subscription(users["7S1"], users["7S2"])
+    subscription = rank_to_subscription(highest_rank)
+    
         # Determine if this email is a fee waiver
         fee_waiver = False
         for user in users["7S1"] + users["7S2"]:
@@ -472,13 +606,13 @@ else:
                 break
 
         if has_active_7s2 and not has_active_7s1:
-            only_7s2.append(email)
+        only_7s2.append(email)
             if fee_waiver:
                 subscription_counts["only_7s2"][subscription]["fee_waiver"] += 1
             else:
                 subscription_counts["only_7s2"][subscription]["regular"] += 1
         elif has_active_7s1 and not has_active_7s2:
-            only_7s1.append(email)
+        only_7s1.append(email)
             # Collect 7S1 profile IDs for tagging
             for user in users["7S1"]:
                 user_id = user.get("id")
@@ -489,47 +623,50 @@ else:
             else:
                 subscription_counts["only_7s1"][subscription]["regular"] += 1
         elif has_active_7s1 and has_active_7s2:
-            both.append(email)
+        both.append(email)
             profiles_in_both_category += total_profiles_for_email
             if fee_waiver:
                 subscription_counts["both"][subscription]["fee_waiver"] += 1
             else:
                 subscription_counts["both"][subscription]["regular"] += 1
 
-    random.shuffle(only_7s2)
-    random.shuffle(only_7s1)
-    random.shuffle(both)
+random.shuffle(only_7s2)
+random.shuffle(only_7s1)
+random.shuffle(both)
 
     # 6. Prepare and print final result
-    result = {
+result = {
         "total_unique_emails": len(all_users_by_email),
         "total_profiles_in_window": len(accurate_users),
         "emails_with_multiple_profiles": emails_with_multiple_profiles,
-        "only_7s2": {
-            "count": len(only_7s2),
-            "sample": only_7s2[:10],
-            "subscription_breakdown": subscription_counts["only_7s2"]
-        },
-        "only_7s1": {
-            "count": len(only_7s1),
-            "sample": only_7s1[:10],
-            "subscription_breakdown": subscription_counts["only_7s1"]
-        },
-        "both": {
-            "count": len(both),
+    "only_7s2": {
+        "count": len(only_7s2),
+        "sample": only_7s2[:10],
+        "subscription_breakdown": subscription_counts["only_7s2"]
+    },
+    "only_7s1": {
+        "count": len(only_7s1),
+        "sample": only_7s1[:10],
+        "subscription_breakdown": subscription_counts["only_7s1"]
+    },
+    "both": {
+        "count": len(both),
             "total_profiles_in_this_category": profiles_in_both_category,
-            "sample": both[:10],
-            "subscription_breakdown": subscription_counts["both"]
+        "sample": both[:10],
+        "subscription_breakdown": subscription_counts["both"]
         }
-    }
+}
 
 print("\n--- Final Results ---")
-print(json.dumps(result, indent=2))
+print(json.dumps(result, indent=2)) 
 
-# 8. Tag 7S1 profiles if tagging mode is enabled
+# 8. Tag and Untag 7S1 profiles if tagging mode is enabled
 tagging_results = None
-if (TAG_MODE or TAG_TEST_MODE) and not TEST_MODE:
-    if only_7s1_profile_ids:
+untagging_results = None
+
+if (TAG_MODE or TAG_TEST_MODE or UNTAG_TEST_MODE) and not TEST_MODE:
+    # Step 8a: Tag 7S1 profiles (if tagging is enabled)
+    if (TAG_MODE or TAG_TEST_MODE) and only_7s1_profile_ids:
         print(f"\n--- Tagging 7S1 Profiles ---")
         # Use test mode for single batch if --tag-test flag is used
         successful_tags, failed_batches = tag_7s1_profiles_in_batches(
@@ -543,7 +680,7 @@ if (TAG_MODE or TAG_TEST_MODE) and not TEST_MODE:
             "test_mode": TAG_TEST_MODE
         }
         result["tagging_results"] = tagging_results
-    else:
+    elif (TAG_MODE or TAG_TEST_MODE):
         print("\n--- No 7S1 profiles to tag ---")
         tagging_results = {
             "total_profiles_available": 0,
@@ -552,8 +689,53 @@ if (TAG_MODE or TAG_TEST_MODE) and not TEST_MODE:
             "test_mode": TAG_TEST_MODE
         }
         result["tagging_results"] = tagging_results
-elif (TAG_MODE or TAG_TEST_MODE) and TEST_MODE:
-    print("\n--- Tagging skipped in TEST MODE ---") 
+    
+    # Step 8b: Untag users who no longer qualify (if untagging is enabled)
+    if UNTAG_MODE:
+        print(f"\n--- Checking for Users to Untag ---")
+        
+        # Fetch all users who currently have the tag
+        tagged_users = fetch_tagged_users()
+        currently_tagged_ids = {user.get("id") for user in tagged_users if user.get("id")}
+        
+        # Create set of users who should have the tag (current 7S1 only users)
+        should_be_tagged_ids = set(only_7s1_profile_ids)
+        
+        # Find users who should be untagged (have tag but shouldn't)
+        users_to_untag = list(currently_tagged_ids - should_be_tagged_ids)
+        
+        print(f"Currently tagged users: {len(currently_tagged_ids)}")
+        print(f"Should be tagged users: {len(should_be_tagged_ids)}")
+        print(f"Users to untag: {len(users_to_untag)}")
+        
+        if users_to_untag:
+            print(f"\n--- Untagging Users ---")
+            # Determine test mode limit
+            untag_test_limit = 10 if UNTAG_TEST_MODE else None
+            
+            successful_untags, failed_untags = untag_users_individually(
+                users_to_untag,
+                test_mode_limit=untag_test_limit
+            )
+            untagging_results = {
+                "total_users_to_untag": len(users_to_untag),
+                "successfully_untagged": successful_untags,
+                "failed_untags": failed_untags,
+                "test_mode": UNTAG_TEST_MODE
+            }
+            result["untagging_results"] = untagging_results
+        else:
+            print("✓ No users need to be untagged")
+            untagging_results = {
+                "total_users_to_untag": 0,
+                "successfully_untagged": 0,
+                "failed_untags": 0,
+                "test_mode": UNTAG_TEST_MODE
+            }
+            result["untagging_results"] = untagging_results
+
+elif (TAG_MODE or TAG_TEST_MODE or UNTAG_TEST_MODE) and TEST_MODE:
+    print("\n--- Tagging/Untagging skipped in TEST MODE ---") 
 
 # 7. Send results to Coda
 config = get_config()
