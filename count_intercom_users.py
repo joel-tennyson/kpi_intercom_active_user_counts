@@ -8,14 +8,19 @@ import uuid
 from datetime import datetime
 
 if len(sys.argv) < 2:
-    print("Usage: python count_intercom_users.py <recency_days> [--test]")
+    print("Usage: python count_intercom_users.py <recency_days> [--test] [--tag]")
     print("  --test: Use sample data instead of querying Intercom API")
+    print("  --tag: Tag 7S1 profiles with 'Recently Active on 7S1 Only' tag")
     sys.exit(1)
 
-# Check for test mode
+# Check for test mode and tagging mode
 TEST_MODE = "--test" in sys.argv
+TAG_MODE = "--tag" in sys.argv
+
 if TEST_MODE:
     print("🧪 Running in TEST MODE - using sample data")
+if TAG_MODE:
+    print("🏷️  Tagging mode enabled - will tag 7S1 profiles")
 
 # --- Configuration ---
 RECENCY_DAYS = int(sys.argv[1])
@@ -66,6 +71,65 @@ def get_config():
     
     return config
 
+def tag_batch_of_users(user_ids, tag_name):
+    """Tag a batch of users with the specified tag name."""
+    url = "https://api.intercom.io/tags"
+    
+    payload = {
+        "name": tag_name,
+        "users": [{"id": user_id} for user_id in user_ids]
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {TOKEN}",
+        "Content-Type": "application/json",
+        "Intercom-Version": "2.14"
+    }
+    
+    response = requests.post(url, json=payload, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+def tag_7s1_profiles_in_batches(profile_ids, tag_name="Recently Active on 7S1 Only", batch_size=50):
+    """Tag 7S1 profiles in batches with rate limiting and error handling."""
+    if not profile_ids:
+        print("No 7S1 profiles to tag.")
+        return 0, 0
+    
+    total_profiles = len(profile_ids)
+    successful_tags = 0
+    failed_batches = 0
+    
+    print(f"\nTagging {total_profiles} 7S1 profiles in batches of {batch_size}...")
+    
+    for i in range(0, total_profiles, batch_size):
+        batch = profile_ids[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (total_profiles + batch_size - 1) // batch_size
+        
+        try:
+            # Make the API call
+            tag_batch_of_users(batch, tag_name)
+            successful_tags += len(batch)
+            print(f"✓ Tagged batch {batch_num}/{total_batches}: {len(batch)} profiles")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"✗ Failed batch {batch_num}/{total_batches}: {e}")
+            failed_batches += 1
+            
+            # Handle rate limiting specifically
+            if hasattr(e, 'response') and e.response.status_code == 429:
+                retry_after = int(e.response.headers.get("Retry-After", 10))
+                print(f"  Rate limited. Waiting {retry_after}s before continuing...")
+                time.sleep(retry_after)
+            
+        # Rate limiting: wait between batches (except for the last one)
+        if i + batch_size < total_profiles:
+            time.sleep(2)  # 2 second delay between batches
+    
+    print(f"Tagging complete: {successful_tags} profiles tagged, {failed_batches} batches failed")
+    return successful_tags, failed_batches
+
 def send_to_coda(data, webhook_url, api_token):
     """Send data to Coda webhook, transforming it into an array of counts."""
 
@@ -107,6 +171,10 @@ def send_to_coda(data, webhook_url, api_token):
         "recency_days": RECENCY_DAYS,
         "counts": counts_array,
     }
+
+    # Include tagging results if available
+    if "tagging_results" in data:
+        coda_payload["tagging_results"] = data["tagging_results"]
 
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -195,8 +263,8 @@ def fetch_all_users(start_query_timestamp):
     max_retries = 5
     retry_count = 0
     
-    filter_block = [
-        {"field": "role", "operator": "=", "value": "user"},
+        filter_block = [
+            {"field": "role", "operator": "=", "value": "user"},
         {"field": "email", "operator": "!=", "value": None},
         {"field": "external_id", "operator": "!=", "value": None},
         {"field": "last_seen_at", "operator": ">", "value": start_query_timestamp}
@@ -210,7 +278,7 @@ def fetch_all_users(start_query_timestamp):
             body["pagination"]["starting_after"] = starting_after
 
         try:
-            response = requests.post(API_URL, headers=headers, json=body)
+        response = requests.post(API_URL, headers=headers, json=body)
             
             # Handle rate limiting with retries
             if response.status_code == 429:
@@ -228,7 +296,7 @@ def fetch_all_users(start_query_timestamp):
             retry_count = 0
             
             response.raise_for_status() # Raise an exception for other bad responses (4xx or 5xx)
-            data = response.json()
+        data = response.json()
 
         except requests.exceptions.RequestException as e:
             print(f"\nError: A critical request error occurred: {e}", file=sys.stderr)
@@ -302,6 +370,7 @@ if TEST_MODE:
     # Use sample data for testing
     result = get_sample_data()
     print("Using static sample data for testing")
+    only_7s1_profile_ids = []  # No real profile IDs in test mode
 else:
     # 1. Calculate Timestamps
     now = int(time.time())
@@ -351,6 +420,9 @@ else:
     only_7s2, only_7s1, both = [], [], []
     emails_with_multiple_profiles = 0
     profiles_in_both_category = 0
+    
+    # For tagging: collect 7S1 profile IDs from users in the "only_7s1" category
+    only_7s1_profile_ids = []
 
     subscription_buckets = ["Unknown", "Admin", "Coach", "Live", "Core", "Free"]
     subscription_counts = {
@@ -359,7 +431,7 @@ else:
         "both": {sub: {"regular": 0, "fee_waiver": 0} for sub in subscription_buckets}
     }
 
-    for email, users in all_users_by_email.items():
+for email, users in all_users_by_email.items():
         s1_profile_count = len(users["7S1"])
         s2_profile_count = len(users["7S2"])
         total_profiles_for_email = s1_profile_count + s2_profile_count
@@ -369,11 +441,11 @@ else:
 
         has_active_7s1 = s1_profile_count > 0
         has_active_7s2 = s2_profile_count > 0
-        
-        # Get highest subscription across both profiles
-        highest_rank = get_highest_subscription(users["7S1"], users["7S2"])
-        subscription = rank_to_subscription(highest_rank)
-
+    
+    # Get highest subscription across both profiles
+    highest_rank = get_highest_subscription(users["7S1"], users["7S2"])
+    subscription = rank_to_subscription(highest_rank)
+    
         # Determine if this email is a fee waiver
         fee_waiver = False
         for user in users["7S1"] + users["7S2"]:
@@ -389,6 +461,11 @@ else:
                 subscription_counts["only_7s2"][subscription]["regular"] += 1
         elif has_active_7s1 and not has_active_7s2:
             only_7s1.append(email)
+            # Collect 7S1 profile IDs for tagging
+            for user in users["7S1"]:
+                user_id = user.get("id")
+                if user_id:
+                    only_7s1_profile_ids.append(user_id)
             if fee_waiver:
                 subscription_counts["only_7s1"][subscription]["fee_waiver"] += 1
             else:
@@ -401,35 +478,58 @@ else:
             else:
                 subscription_counts["both"][subscription]["regular"] += 1
 
-    random.shuffle(only_7s2)
-    random.shuffle(only_7s1)
-    random.shuffle(both)
+random.shuffle(only_7s2)
+random.shuffle(only_7s1)
+random.shuffle(both)
 
     # 6. Prepare and print final result
-    result = {
+result = {
         "total_unique_emails": len(all_users_by_email),
         "total_profiles_in_window": len(accurate_users),
         "emails_with_multiple_profiles": emails_with_multiple_profiles,
-        "only_7s2": {
-            "count": len(only_7s2),
-            "sample": only_7s2[:10],
-            "subscription_breakdown": subscription_counts["only_7s2"]
-        },
-        "only_7s1": {
-            "count": len(only_7s1),
-            "sample": only_7s1[:10],
-            "subscription_breakdown": subscription_counts["only_7s1"]
-        },
-        "both": {
-            "count": len(both),
+    "only_7s2": {
+        "count": len(only_7s2),
+        "sample": only_7s2[:10],
+        "subscription_breakdown": subscription_counts["only_7s2"]
+    },
+    "only_7s1": {
+        "count": len(only_7s1),
+        "sample": only_7s1[:10],
+        "subscription_breakdown": subscription_counts["only_7s1"]
+    },
+    "both": {
+        "count": len(both),
             "total_profiles_in_this_category": profiles_in_both_category,
-            "sample": both[:10],
-            "subscription_breakdown": subscription_counts["both"]
+        "sample": both[:10],
+        "subscription_breakdown": subscription_counts["both"]
         }
-    }
+}
 
 print("\n--- Final Results ---")
 print(json.dumps(result, indent=2))
+
+# 8. Tag 7S1 profiles if tagging mode is enabled
+tagging_results = None
+if TAG_MODE and not TEST_MODE:
+    if only_7s1_profile_ids:
+        print(f"\n--- Tagging 7S1 Profiles ---")
+        successful_tags, failed_batches = tag_7s1_profiles_in_batches(only_7s1_profile_ids)
+        tagging_results = {
+            "total_profiles_to_tag": len(only_7s1_profile_ids),
+            "successfully_tagged": successful_tags,
+            "failed_batches": failed_batches
+        }
+        result["tagging_results"] = tagging_results
+    else:
+        print("\n--- No 7S1 profiles to tag ---")
+        tagging_results = {
+            "total_profiles_to_tag": 0,
+            "successfully_tagged": 0,
+            "failed_batches": 0
+        }
+        result["tagging_results"] = tagging_results
+elif TAG_MODE and TEST_MODE:
+    print("\n--- Tagging skipped in TEST MODE ---") 
 
 # 7. Send results to Coda
 config = get_config()
