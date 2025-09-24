@@ -28,8 +28,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run the user counting script
-        run: python ./count_intercom_users.py 1
+      - name: Run the user counting and tagging script
+        run: python ./count_intercom_users.py 1 --tag
         env:
           INTERCOM_TOKEN: ${{ secrets.INTERCOM_TOKEN }}
           CODA_WEBHOOK_URL: ${{ secrets.CODA_WEBHOOK_URL }}
